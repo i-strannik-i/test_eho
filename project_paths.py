@@ -14,6 +14,7 @@ TRAINING_RUN_LOG_FILE = f"{LOGS_DIR}/training.log"
 BUILD_RUN_LOG_FILE = f"{LOGS_DIR}/build.log"
 
 TRAINING_DATA_FILE = "data/processed/train_data.jsonl"
+TEACHER_DATA_FILE = "data/teacher/teacher_lessons.jsonl"
 MODEL_INFO_FILE = "models/model_info.json"
 LORA_OUTPUT_DIR = "models/echo-lora"
 MERGED_MODEL_DIR = "models/echo-merged"

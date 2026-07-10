@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 *.pyo
+.venv/
 .tools/
 .archive_stage/
 
@@ -28,6 +29,8 @@ llama_quantize_win.zip
 
 data/processed/*
 !data/processed/.gitkeep
+data/teacher/*
+!data/teacher/.gitkeep
 
 knowledge_input/*
 !knowledge_input/.gitkeep

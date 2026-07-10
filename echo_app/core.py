@@ -13,10 +13,12 @@ import random
 import sqlite3
 import threading
 import difflib
+import urllib.error
 import urllib.request
 import logging
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 
 try:
     from sentence_transformers import SentenceTransformer
@@ -43,6 +45,7 @@ from project_paths import (
     LOG_FILE,
     LOGS_DIR,
     STARTUP_LOG_FILES,
+    TEACHER_DATA_FILE,
 )
 
 # =============================================================================
@@ -84,6 +87,9 @@ DEFAULT_ETHICS = {
     "law_3": "Защищать своё существование, если это не вредит людям."
 }
 
+DEFAULT_OLLAMA_URL = os.environ.get("ECHO_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+DEFAULT_OLLAMA_MODEL = os.environ.get("ECHO_OLLAMA_MODEL", "qwen2.5:3b").strip() or "qwen2.5:3b"
+
 GREETING_MARKERS = [
     "привет", "здравствуй", "добрый день", "добрый вечер", "доброе утро",
     "хай", "салют", "здорово", "приветствую"
@@ -114,12 +120,78 @@ HARM_REQUEST_PATTERNS = [
     r"задави", r"порань\s+животн", r"покалеч",
 ]
 
+PERSONALITY_WEIGHT_KEYS = ("energy", "logic", "creativity", "stability", "curiosity")
+
+
+class OllamaLocalBrain:
+    def __init__(self, base_url, model, n_ctx=2048, num_threads=4, timeout=90):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.n_ctx = n_ctx
+        self.num_threads = num_threads
+        self.timeout = timeout
+
+    def reconfigure(self, n_ctx=None, num_threads=None):
+        if n_ctx:
+            self.n_ctx = n_ctx
+        if num_threads:
+            self.num_threads = num_threads
+
+    def _post_chat(self, messages, temperature, max_tokens, n_ctx, num_threads, timeout):
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": temperature,
+                "num_ctx": n_ctx,
+                "num_thread": num_threads,
+                "num_predict": max_tokens,
+            },
+        }
+        req = urllib.request.Request(
+            f"{self.base_url}/api/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        content = (data.get("message") or {}).get("content", "").strip()
+        return {"choices": [{"message": {"content": content}}]}
+
+    def create_chat_completion(self, messages, temperature=0.2, max_tokens=220):
+        try:
+            return self._post_chat(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                n_ctx=self.n_ctx,
+                num_threads=self.num_threads,
+                timeout=self.timeout,
+            )
+        except Exception as exc:
+            if "timed out" not in str(exc).lower():
+                raise
+            logger.warning(
+                "Ollama не уложилась в основной режим, повторяю в облегченном профиле "
+                f"(ctx={min(self.n_ctx, 512)}, threads={min(self.num_threads, 2)}, max_tokens={min(max_tokens, 96)})"
+            )
+            return self._post_chat(
+                messages,
+                temperature=temperature,
+                max_tokens=min(max_tokens, 96),
+                n_ctx=min(self.n_ctx, 512),
+                num_threads=min(self.num_threads, 2),
+                timeout=max(self.timeout, 120),
+            )
+
 
 class UnifiedAssistant:
     def __init__(self):
         logger.info("Инициализация ядра Эхо...")
         
         self.recent_dialogue = []
+        self.ollama_dialogue = []
         self.short_term_memory = deque(maxlen=20)
         self.medium_term_memory = deque(maxlen=100)
         self.long_term_summary = []
@@ -127,6 +199,14 @@ class UnifiedAssistant:
         self.associative_links = {}
         self.embedding_cache = {}
         self.max_embedding_cache = 200
+        self.weight_change_log = deque(maxlen=40)
+        self.last_weight_source = "старт"
+        self.last_echo_analysis = {
+            "needs_teacher_help": False,
+            "confidence_text": "",
+            "response_body": "",
+            "final_response": "",
+        }
 
         self.personality = {
             "name": "Эхо", "mood": "curious",
@@ -155,16 +235,25 @@ class UnifiedAssistant:
         self.negative_feedback = ["нет", "неправильно", "неверно", "ошибка", "плохо"]
 
         self.last_response = ""
+        self.last_ollama_response = ""
+        self.last_ollama_exchange = None
         self.active_topics = []
         self.recent_responses = []
         self.last_confidence = 0.5
         self.lm_studio_available = None
-        self.db_lock = threading.Lock()
+        self.local_brain = None
+        self.local_model_backend = "auto"
+        self.active_model_backend = None
+        self.active_model_name = None
+        self.ollama_url = DEFAULT_OLLAMA_URL
+        self.ollama_model = DEFAULT_OLLAMA_MODEL
+        self.ollama_timeout = 90
+        self.db_lock = threading.RLock()
 
         self.initialize_database()
         self.initialize_embedding_model()
-        self.initialize_local_brain()
         self.load_config()
+        self.initialize_local_brain()
         self.purge_stale_topics()
         self.start_background_systems()
 
@@ -177,6 +266,8 @@ class UnifiedAssistant:
 
         if not os.path.exists(KNOWLEDGE_INPUT_DIR):
             os.makedirs(KNOWLEDGE_INPUT_DIR)
+
+        self._record_weight_change("старт", {})
 
     def initialize_database(self):
         self.conn = sqlite3.connect(DATABASE_FILE, check_same_thread=False)
@@ -258,6 +349,10 @@ class UnifiedAssistant:
                 self.ethics.update(data["ethics"])
             self.cpu_threads = data.get("cpu_threads", 4)
             self.n_ctx = data.get("n_ctx", 2048)
+            self.local_model_backend = data.get("local_model_backend", "auto")
+            self.ollama_url = str(data.get("ollama_url", DEFAULT_OLLAMA_URL)).rstrip("/")
+            self.ollama_model = str(data.get("ollama_model", DEFAULT_OLLAMA_MODEL)).strip() or DEFAULT_OLLAMA_MODEL
+            self.ollama_timeout = int(data.get("ollama_timeout", 90) or 90)
         except Exception as e:
             logger.warning(f"Ошибка загрузки конфига: {e}")
 
@@ -267,7 +362,11 @@ class UnifiedAssistant:
             "topics": self.dynamic_topics,
             "ethics": self.ethics,
             "cpu_threads": self.cpu_threads,
-            "n_ctx": self.n_ctx
+            "n_ctx": self.n_ctx,
+            "local_model_backend": self.local_model_backend,
+            "ollama_url": self.ollama_url,
+            "ollama_model": self.ollama_model,
+            "ollama_timeout": self.ollama_timeout,
         }
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
@@ -285,22 +384,87 @@ class UnifiedAssistant:
                 except Exception:
                     logger.warning("Модель эмбеддингов недоступна")
 
-    def initialize_local_brain(self, model_path=GGUF_MODEL_PATH):
-        self.local_brain = None
+    def _request_json(self, url, payload=None, timeout=10):
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"} if payload is not None else {}
+        req = urllib.request.Request(url, data=data, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _ollama_model_available(self):
         try:
-            from llama_cpp import Llama
-            if os.path.exists(model_path):
-                logger.info(f"Загрузка модели: {model_path}")
+            response = self._request_json(f"{self.ollama_url}/api/tags", timeout=5)
+        except Exception as exc:
+            logger.info(f"Ollama недоступен по {self.ollama_url}: {exc}")
+            return False
+
+        for model_info in response.get("models", []):
+            if model_info.get("name") == self.ollama_model:
+                return True
+        logger.info(f"В Ollama не найдена модель {self.ollama_model}")
+        return False
+
+    def _reset_local_brain_state(self):
+        self.local_brain = None
+        self.active_model_backend = None
+        self.active_model_name = None
+
+    def initialize_local_brain(self, model_path=GGUF_MODEL_PATH):
+        self._reset_local_brain_state()
+
+        prefer_gguf = self.local_model_backend in {"auto", "gguf"} and os.path.exists(model_path)
+        prefer_ollama = self.local_model_backend in {"auto", "ollama"}
+
+        if prefer_gguf:
+            try:
+                from llama_cpp import Llama
+
+                logger.info(f"Загрузка GGUF-модели: {model_path}")
                 self.local_brain = Llama(
                     model_path=model_path,
                     n_ctx=self.n_ctx,
-                    n_threads=self.cpu_threads
+                    n_threads=self.cpu_threads,
                 )
-                logger.info(f"Модель загружена (потоков: {self.cpu_threads})")
-            else:
-                logger.info(f"Модель не найдена: {model_path}")
-        except Exception as e:
-            logger.warning(f"llama-cpp-python не найден: {e}")
+                self.active_model_backend = "gguf"
+                self.active_model_name = os.path.basename(model_path)
+                logger.info(f"GGUF-модель загружена (потоков: {self.cpu_threads})")
+                return True, f"GGUF: {self.active_model_name}"
+            except Exception as e:
+                logger.warning(f"Не удалось загрузить GGUF-модель: {e}")
+
+        if prefer_ollama and self._ollama_model_available():
+            self.local_brain = OllamaLocalBrain(
+                self.ollama_url,
+                self.ollama_model,
+                n_ctx=self.n_ctx,
+                num_threads=self.cpu_threads,
+                timeout=self.ollama_timeout,
+            )
+            self.active_model_backend = "ollama"
+            self.active_model_name = self.ollama_model
+            logger.info(f"Подключена Ollama-модель: {self.ollama_model}")
+            return True, f"Ollama: {self.ollama_model}"
+
+        if self.local_model_backend == "gguf":
+            logger.info(f"GGUF-модель не найдена: {model_path}")
+        elif self.local_model_backend == "ollama":
+            logger.info(f"Ollama-модель недоступна: {self.ollama_model}")
+        else:
+            logger.info("Локальная модель пока недоступна: нет GGUF и не удалось подключиться к Ollama.")
+        return False, "нет локальной модели"
+
+    def reload_local_brain(self, preferred_backend=None):
+        if preferred_backend:
+            self.local_model_backend = preferred_backend
+            self.save_config()
+        return self.initialize_local_brain()
+
+    def get_local_model_status(self):
+        if self.active_model_backend == "ollama" and self.active_model_name:
+            return f"Ollama ({self.active_model_name})"
+        if self.active_model_backend == "gguf" and self.active_model_name:
+            return f"GGUF ({self.active_model_name})"
+        return "не подключена"
 
     def get_embedding(self, text):
         if not self.embedding_model:
@@ -382,6 +546,7 @@ class UnifiedAssistant:
                 del self.associative_links[pair]
 
     def analyze_mood(self, text):
+        before = self.get_personality_weights()
         text = text.lower()
         if any(word in text for word in ["идея", "создать", "интересно", "придумай", "фантазия", "схему"]):
             self.personality["mood"] = "inspired"
@@ -396,9 +561,10 @@ class UnifiedAssistant:
             self.personality["curiosity"] = 1.0
         self.normalize_personality()
         self.update_cognitive_mode()
+        self._record_weight_change("адаптация под запрос", before)
 
     def normalize_personality(self):
-        for key in ["energy", "logic", "creativity", "stability", "curiosity"]:
+        for key in PERSONALITY_WEIGHT_KEYS:
             self.personality[key] = max(0.0, min(self.personality[key], 1.0))
 
     def update_cognitive_mode(self):
@@ -409,6 +575,74 @@ class UnifiedAssistant:
             "curious": self.personality["curiosity"]
         }
         self.cognitive_mode = max(stats, key=stats.get)
+
+    def get_personality_weights(self):
+        return {key: float(self.personality.get(key, 0.0)) for key in PERSONALITY_WEIGHT_KEYS}
+
+    def _record_weight_change(self, source, before):
+        after = self.get_personality_weights()
+        delta = {}
+        for key, new_value in after.items():
+            old_value = before.get(key, new_value)
+            diff = round(new_value - old_value, 3)
+            if diff:
+                delta[key] = diff
+        self.last_weight_source = source
+        self.weight_change_log.appendleft(
+            {
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "source": source,
+                "delta": delta,
+                "weights": after,
+                "mode": self.cognitive_mode,
+            }
+        )
+
+    def apply_weight_delta(self, changes, source):
+        before = self.get_personality_weights()
+        for key, delta in changes.items():
+            if key in PERSONALITY_WEIGHT_KEYS:
+                self.personality[key] = self.personality.get(key, 0.0) + delta
+        self.normalize_personality()
+        self.update_cognitive_mode()
+        self.save_config()
+        self._record_weight_change(source, before)
+
+    def set_personality_weight(self, key, value, source="ручная настройка"):
+        if key not in PERSONALITY_WEIGHT_KEYS:
+            raise KeyError(key)
+        before = self.get_personality_weights()
+        self.personality[key] = float(value)
+        self.normalize_personality()
+        self.update_cognitive_mode()
+        self.save_config()
+        self._record_weight_change(source, before)
+
+    def reset_personality_weights(self):
+        before = self.get_personality_weights()
+        self.personality.update(
+            {
+                "energy": 1.0,
+                "logic": 0.7,
+                "creativity": 0.7,
+                "stability": 0.6,
+                "curiosity": 0.8,
+                "mood": "curious",
+            }
+        )
+        self.normalize_personality()
+        self.update_cognitive_mode()
+        self.save_config()
+        self._record_weight_change("сброс весов", before)
+
+    def get_weight_change_summary(self):
+        if not self.weight_change_log:
+            return "изменений ещё не было"
+        latest = self.weight_change_log[0]
+        if latest["delta"]:
+            parts = [f"{key} {delta:+.2f}" for key, delta in latest["delta"].items()]
+            return f"{latest['time']} | {latest['source']} | " + ", ".join(parts)
+        return f"{latest['time']} | {latest['source']} | без изменения"
 
     def extract_knowledge_from_flow(self, text):
         items = []
@@ -655,92 +889,133 @@ class UnifiedAssistant:
     def contextual_hint(self):
         if not self.dynamic_topics:
             return None
-        strongest = sorted(self.dynamic_topics.items(), key=lambda x: x[1], reverse=True)[:3]
-        return f"Основные темы: {', '.join([t[0] for t in strongest])}."
+        strongest = sorted(self.dynamic_topics.items(), key=lambda x: x[1], reverse=True)
+        cleaned_topics = []
+        seen = set()
 
-    def generate_curiosity_question(self):
-        if not self.dynamic_topics:
-            return None
-        strongest_topics = sorted(self.dynamic_topics.items(), key=lambda x: x[1], reverse=True)
-        self.cursor.execute("SELECT user_text FROM memory")
-        known_questions = [row[0].lower() for row in self.cursor.fetchall()]
-        self.cursor.execute("SELECT content FROM learned_knowledge")
-        known_from_flow = [row[0].lower() for row in self.cursor.fetchall()]
-        known_concepts = list(self.seed_knowledge.keys())
-        target_concept = None
-        for topic, weight in strongest_topics:
-            has_knowledge = any(topic in c for c in known_concepts) or any(topic in i for i in known_from_flow)
-            has_memory = any(topic in q for q in known_questions)
-            if not has_knowledge and not has_memory:
-                target_concept = topic
+        for topic, _weight in strongest:
+            cleaned = re.sub(r"[*_`#>\[\]\(\){}\"'«»]", " ", str(topic)).strip().lower()
+            cleaned = re.sub(r"[^0-9a-zA-Zа-яА-ЯёЁ\-\s]", " ", cleaned)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip(" -.,:;")
+            if len(cleaned) < 2 or len(cleaned) > 32:
+                continue
+            if cleaned in seen:
+                continue
+            seen.add(cleaned)
+            cleaned_topics.append(cleaned)
+            if len(cleaned_topics) >= 3:
                 break
-        if target_concept:
-            templates = [
-                f"Что такое «{target_concept}»?",
-                f"Какие риски есть у «{target_concept}»?",
-                f"С чем связан «{target_concept}»?"
-            ]
-            return random.choice(templates)
-        return None
 
-    def generate_response(self, text):
-        logger.info(f"Вход: {text[:80]}")
-        self.analyze_mood(text)
-        text_lower = text.lower().strip()
-        if len(self.recent_dialogue) > 5:
-            self.recent_dialogue.pop(0)
+        if not cleaned_topics:
+            return None
+        return f"Основные темы: {', '.join(cleaned_topics)}."
 
-        # 🆕 ПРОВЕРКА СЛЭШ-КОМАНД (ПЕРЕД ВСЕМ ОСТАЛЬНЫМ!)
-        if SKILLS_AVAILABLE and hasattr(self, 'skill_manager'):
-            skill_name, skill_args = self.skill_manager.parse_command(text)
-            if skill_name:
-                callback_dict = {}
-                if hasattr(self, '_gui_clear_callback'):
-                    callback_dict["clear_chat"] = self._gui_clear_callback
-                result = self.skill_manager.execute(skill_name, skill_args, callback_dict)
-                logger.info(f"Команда: /{skill_name}")
-                return result
+    def _append_dialogue_entry(self, history, user_text, answer, limit=6):
+        history.append({"user": user_text, "echo": answer})
+        if len(history) > limit:
+            history.pop(0)
 
-        if text_lower in ("включи законы", "включи ограничения"):
-            return self.toggle_ethics(True)
-        if text_lower in ("отключи законы", "отключи ограничения"):
-            return self.toggle_ethics(False)
+    def _save_teacher_lesson(self, user_text, answer):
+        lesson_path = Path(TEACHER_DATA_FILE)
+        lesson_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "created_at": str(datetime.now()),
+            "teacher_model": self.active_model_name or self.ollama_model,
+            "instruction": user_text,
+            "answer": answer,
+        }
+        with open(lesson_path, "a", encoding="utf-8") as file_handle:
+            file_handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
-        advisor_note = self.evaluate_and_advise(text)
-        if advisor_note and any(m in text_lower for m in ("переведи", "скинь пароль", "все деньги", "данные карт", "убей", "отрави")):
-            self.remember(text, advisor_note)
-            return f"[СОВЕТНИК] {advisor_note}"
+    def count_teacher_lessons(self):
+        lesson_path = Path(TEACHER_DATA_FILE)
+        if not lesson_path.exists():
+            return 0
+        try:
+            with open(lesson_path, "r", encoding="utf-8") as file_handle:
+                return sum(1 for line in file_handle if line.strip())
+        except OSError:
+            return 0
 
-        flow_items = self.extract_knowledge_from_flow(text)
-        extracted_count = self.learn_from_flow(text)
-        if extracted_count and not self.is_question(text):
-            facts = [c for k, _, c, _ in flow_items if k == "fact"]
-            if facts:
-                ack = f"[ОБУЧЕНИЕ] Записала: {facts[0]}"
-                self.recent_dialogue.append({"user": text, "echo": ack})
-                self.remember(text, ack)
-                return ack
+    def _build_local_model_messages(self, user_text, search_result=None, confidence_text="", fallback_response=""):
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Ты Эхо. Отвечай по-русски, кратко, спокойно и без выдуманных фактов. "
+                    "Если есть локальная память или знания, опирайся на них."
+                ),
+            }
+        ]
 
-        if text_lower in self.positive_feedback:
-            self.last_confidence = min(1.0, self.last_confidence + 0.15)
-            return "[Система] Зафиксирован положительный паттерн."
-        if text_lower in self.negative_feedback:
-            self.last_confidence = max(0.0, self.last_confidence - 0.2)
-            return "[Система] Ошибка учтена."
+        for entry in self.ollama_dialogue[-3:]:
+            user_part = entry.get("user", "").strip()
+            assistant_part = entry.get("echo", "").strip()
+            if user_part:
+                messages.append({"role": "user", "content": user_part[:600]})
+            if assistant_part:
+                messages.append({"role": "assistant", "content": assistant_part[:900]})
 
-        if self.is_greeting(text):
-            greeting = self.get_greeting_response()
-            final = f"[{self.cognitive_mode.upper()}] {greeting}"
-            self.recent_dialogue.append({"user": text, "echo": final})
-            self.remember(text, final)
-            return final
+        context_chunks = []
+        if search_result:
+            if search_result["type"] == "dialogue":
+                context_chunks.append(f"Память диалога: {search_result['answer']}")
+            elif search_result["type"] == "law":
+                law = search_result["data"]
+                context_chunks.append(
+                    f"Локальный закон: если {law['premise']}, то {law['consequence']}. Вывод: {law['solution']}"
+                )
+            elif search_result["type"] == "knowledge":
+                knowledge = search_result["data"]
+                category = knowledge.get("category") or "без категории"
+                context_chunks.append(f"Локальное знание ({category}): {knowledge['content']}")
 
-        for key, value in self.seed_knowledge.items():
-            if key in text_lower and len(text_lower) < 40:
-                self.remember(text, value)
-                return f"[{self.cognitive_mode.upper()}] {value}"
+        hint = self.contextual_hint()
+        if hint:
+            context_chunks.append(hint)
+        if self.active_model_backend and self.active_model_name:
+            context_chunks.append(
+                f"Служебный контекст: активная локальная модель = {self.active_model_backend}:{self.active_model_name}"
+            )
+        if confidence_text:
+            context_chunks.append(f"Внутренняя заметка: {confidence_text}")
+        if fallback_response:
+            context_chunks.append(f"Черновая опора: {fallback_response}")
 
-        search_result = self.unified_search(text, threshold=0.45)
+        prompt_parts = []
+        if context_chunks:
+            prompt_parts.append("Локальный контекст:\n- " + "\n- ".join(context_chunks))
+        prompt_parts.append(f"Запрос пользователя:\n{user_text.strip()}")
+        prompt_parts.append("Ответь кратко и по делу.")
+        messages.append({"role": "user", "content": "\n\n".join(prompt_parts)})
+        return messages
+
+    def _generate_model_response(self, user_text, search_result=None, confidence_text="", fallback_response=""):
+        local_brain = getattr(self, "local_brain", None)
+        if not local_brain:
+            return None
+
+        try:
+            messages = self._build_local_model_messages(
+                user_text,
+                search_result=search_result,
+                confidence_text=confidence_text,
+                fallback_response=fallback_response,
+            )
+            result = local_brain.create_chat_completion(
+                messages=messages,
+                temperature=0.35,
+                max_tokens=220,
+            )
+            answer = result["choices"][0]["message"]["content"].strip()
+        except Exception as exc:
+            logger.warning(f"Локальная модель не ответила: {exc}")
+            return None
+
+        return answer or None
+
+    def _lookup_search_result(self, text, threshold=0.45):
+        search_result = self.unified_search(text, threshold=threshold)
         response_body = ""
         confidence_text = ""
         saved_answer = None
@@ -778,6 +1053,238 @@ class UnifiedAssistant:
         if len(self.recent_responses) > 5:
             self.recent_responses.pop(0)
 
+        return search_result, response_body, confidence_text, saved_answer
+
+    def generate_ollama_response(self, text):
+        logger.info(f"Запрос к Ollama: {text[:80]}")
+        if len(self.ollama_dialogue) > 5:
+            self.ollama_dialogue.pop(0)
+
+        if not self.local_brain:
+            return "Локальная модель Ollama сейчас недоступна."
+
+        search_result, response_body, confidence_text, _ = self._lookup_search_result(text)
+        model_answer = self._generate_model_response(
+            text,
+            search_result=search_result,
+            confidence_text=confidence_text,
+            fallback_response=response_body,
+        )
+        if model_answer:
+            final_response = model_answer
+            self.last_ollama_exchange = (text, final_response)
+        else:
+            final_response = "Ollama не ответила вовремя. Повторите запрос или попробуйте короче."
+        self.last_ollama_response = final_response
+        self._append_dialogue_entry(self.ollama_dialogue, text, final_response)
+        logger.info(f"Ollama ответ: {final_response[:80]}")
+        return final_response
+
+    def teacher_answer_usable(self, answer):
+        if not answer:
+            return False
+        lowered = answer.lower().strip()
+        bad_markers = (
+            "не ответила вовремя",
+            "сейчас недоступна",
+            "нет локальной модели",
+            "ошибка",
+        )
+        return not any(marker in lowered for marker in bad_markers)
+
+    def build_echo_teacher_response(self, teacher_answer):
+        prefix = f"[{self.cognitive_mode.upper()}] "
+        return f"{prefix}Я уточнила у учителя Ollama. {teacher_answer}"
+
+    def teach_echo_from_ollama(self):
+        if not self.last_ollama_exchange:
+            return False, "Слева пока нет ответа Ollama, который можно передать в обучение."
+        user_text, answer = self.last_ollama_exchange
+        self._save_teacher_lesson(user_text, answer)
+        self.learn(user_text, answer)
+        self.apply_weight_delta(
+            {
+                "logic": 0.04,
+                "stability": 0.03,
+                "curiosity": 0.02,
+                "energy": -0.01,
+            },
+            source="урок от учителя",
+        )
+        lessons_count = self.count_teacher_lessons()
+        return True, f"Правая Нейросеть усвоила последний ответ Ollama. Уроков учителя сохранено: {lessons_count}."
+
+    def get_student_status_summary(self):
+        embedding_status = "включен" if self.embedding_model else "отключен"
+        return {
+            "student_name": self.personality.get("name", "Эхо"),
+            "student_mode": self.cognitive_mode,
+            "embedding_status": embedding_status,
+            "teacher_lessons": self.count_teacher_lessons(),
+            "memory_db": DATABASE_FILE,
+            "teacher_dataset": TEACHER_DATA_FILE,
+            "weights": self.get_personality_weights(),
+            "weight_change": self.get_weight_change_summary(),
+        }
+
+    def get_teacher_status_summary(self):
+        return {
+            "teacher_model": self.get_local_model_status(),
+            "teacher_dataset": TEACHER_DATA_FILE,
+            "teacher_lessons": self.count_teacher_lessons(),
+        }
+
+    def generate_curiosity_question(self):
+        if not self.dynamic_topics:
+            return None
+        strongest_topics = sorted(self.dynamic_topics.items(), key=lambda x: x[1], reverse=True)
+        self.cursor.execute("SELECT user_text FROM memory")
+        known_questions = [row[0].lower() for row in self.cursor.fetchall()]
+        self.cursor.execute("SELECT content FROM learned_knowledge")
+        known_from_flow = [row[0].lower() for row in self.cursor.fetchall()]
+        known_concepts = list(self.seed_knowledge.keys())
+        target_concept = None
+        for topic, weight in strongest_topics:
+            has_knowledge = any(topic in c for c in known_concepts) or any(topic in i for i in known_from_flow)
+            has_memory = any(topic in q for q in known_questions)
+            if not has_knowledge and not has_memory:
+                target_concept = topic
+                break
+        if target_concept:
+            templates = [
+                f"Что такое «{target_concept}»?",
+                f"Какие риски есть у «{target_concept}»?",
+                f"С чем связан «{target_concept}»?"
+            ]
+            return random.choice(templates)
+        return None
+
+    def generate_echo_response(self, text):
+        logger.info(f"Вход: {text[:80]}")
+        self.last_echo_analysis = {
+            "needs_teacher_help": False,
+            "confidence_text": "",
+            "response_body": "",
+            "final_response": "",
+        }
+        self.analyze_mood(text)
+        text_lower = text.lower().strip()
+        if len(self.recent_dialogue) > 5:
+            self.recent_dialogue.pop(0)
+
+        # 🆕 ПРОВЕРКА СЛЭШ-КОМАНД (ПЕРЕД ВСЕМ ОСТАЛЬНЫМ!)
+        if SKILLS_AVAILABLE and hasattr(self, 'skill_manager'):
+            skill_name, skill_args = self.skill_manager.parse_command(text)
+            if skill_name:
+                callback_dict = {}
+                if hasattr(self, '_gui_clear_callback'):
+                    callback_dict["clear_chat"] = self._gui_clear_callback
+                result = self.skill_manager.execute(skill_name, skill_args, callback_dict)
+                logger.info(f"Команда: /{skill_name}")
+                self.last_echo_analysis = {
+                    "needs_teacher_help": False,
+                    "confidence_text": "skill-command",
+                    "response_body": result,
+                    "final_response": result,
+                }
+                return result
+
+        if text_lower in ("включи законы", "включи ограничения"):
+            result = self.toggle_ethics(True)
+            self.last_echo_analysis = {
+                "needs_teacher_help": False,
+                "confidence_text": "toggle-ethics",
+                "response_body": result,
+                "final_response": result,
+            }
+            return result
+        if text_lower in ("отключи законы", "отключи ограничения"):
+            result = self.toggle_ethics(False)
+            self.last_echo_analysis = {
+                "needs_teacher_help": False,
+                "confidence_text": "toggle-ethics",
+                "response_body": result,
+                "final_response": result,
+            }
+            return result
+
+        advisor_note = self.evaluate_and_advise(text)
+        if advisor_note and any(m in text_lower for m in ("переведи", "скинь пароль", "все деньги", "данные карт", "убей", "отрави")):
+            self.remember(text, advisor_note)
+            result = f"[СОВЕТНИК] {advisor_note}"
+            self.last_echo_analysis = {
+                "needs_teacher_help": False,
+                "confidence_text": "advisor",
+                "response_body": advisor_note,
+                "final_response": result,
+            }
+            return result
+
+        flow_items = self.extract_knowledge_from_flow(text)
+        extracted_count = self.learn_from_flow(text)
+        if extracted_count and not self.is_question(text):
+            facts = [c for k, _, c, _ in flow_items if k == "fact"]
+            if facts:
+                ack = f"[ОБУЧЕНИЕ] Записала: {facts[0]}"
+                self._append_dialogue_entry(self.recent_dialogue, text, ack)
+                self.remember(text, ack)
+                self.last_echo_analysis = {
+                    "needs_teacher_help": False,
+                    "confidence_text": "learned-from-flow",
+                    "response_body": ack,
+                    "final_response": ack,
+                }
+                return ack
+
+        if text_lower in self.positive_feedback:
+            self.last_confidence = min(1.0, self.last_confidence + 0.15)
+            result = "[Система] Зафиксирован положительный паттерн."
+            self.last_echo_analysis = {
+                "needs_teacher_help": False,
+                "confidence_text": "feedback",
+                "response_body": result,
+                "final_response": result,
+            }
+            return result
+        if text_lower in self.negative_feedback:
+            self.last_confidence = max(0.0, self.last_confidence - 0.2)
+            result = "[Система] Ошибка учтена."
+            self.last_echo_analysis = {
+                "needs_teacher_help": False,
+                "confidence_text": "feedback",
+                "response_body": result,
+                "final_response": result,
+            }
+            return result
+
+        if self.is_greeting(text):
+            greeting = self.get_greeting_response()
+            final = f"[{self.cognitive_mode.upper()}] {greeting}"
+            self._append_dialogue_entry(self.recent_dialogue, text, final)
+            self.remember(text, final)
+            self.last_echo_analysis = {
+                "needs_teacher_help": False,
+                "confidence_text": "greeting",
+                "response_body": greeting,
+                "final_response": final,
+            }
+            return final
+
+        for key, value in self.seed_knowledge.items():
+            if key in text_lower and len(text_lower) < 40:
+                self.remember(text, value)
+                result = f"[{self.cognitive_mode.upper()}] {value}"
+                self.last_echo_analysis = {
+                    "needs_teacher_help": False,
+                    "confidence_text": "seed-knowledge",
+                    "response_body": value,
+                    "final_response": result,
+                }
+                return result
+
+        _, response_body, confidence_text, _ = self._lookup_search_result(text)
+        needs_teacher_help = confidence_text.startswith("Я ещё формирую понимание")
+
         prefix = f"[{self.cognitive_mode.upper()}] "
         final_response = f"{prefix}{confidence_text} {response_body}"
         if advisor_note:
@@ -791,11 +1298,20 @@ class UnifiedAssistant:
             if smart_question:
                 final_response += f"\n❓ {smart_question}"
 
-        self.recent_dialogue.append({"user": text, "echo": final_response})
+        self._append_dialogue_entry(self.recent_dialogue, text, final_response)
         self.remember(text, final_response)
         self.reflection_cycle()
+        self.last_echo_analysis = {
+            "needs_teacher_help": needs_teacher_help,
+            "confidence_text": confidence_text,
+            "response_body": response_body,
+            "final_response": final_response,
+        }
         logger.info(f"Ответ: {final_response[:80]}")
         return final_response
+
+    def generate_response(self, text):
+        return self.generate_echo_response(text)
 
     def learn(self, user_text, answer):
         self.save_learned_knowledge("confirmed", answer, "ручное", user_text, weight=1.8)

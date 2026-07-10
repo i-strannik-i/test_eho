@@ -8,7 +8,7 @@ from pathlib import Path
 
 from config import CONFIG
 from knowledge_utils import iter_knowledge_files, read_knowledge_file, split_large_text
-from project_paths import TRAINING_DATA_FILE
+from project_paths import TEACHER_DATA_FILE, TRAINING_DATA_FILE
 
 
 class DataPreparator:
@@ -34,10 +34,14 @@ class DataPreparator:
         )
 
     def download_and_parse_hf_datasets(self):
-        from datasets import load_dataset
+        source_map = {"hf_alice": [], "hf_yagpt": []}
+        try:
+            from datasets import load_dataset
+        except ImportError:
+            print("  Пакет datasets не установлен, внешние датасеты Hugging Face пропущены.")
+            return source_map
 
         print("  Загрузка датасетов с Hugging Face...")
-        source_map = {"hf_alice": [], "hf_yagpt": []}
 
         try:
             print("    [1/2] ZennyKenny/yandex-alice-sessions-large-syn")
@@ -92,6 +96,51 @@ class DataPreparator:
             )
         print(f"  Извлечено локальных диалогов: {len(dialogues)}")
         return dialogues
+
+    def extract_teacher_lessons(self):
+        lesson_path = Path(TEACHER_DATA_FILE)
+        if not lesson_path.exists():
+            print("  Извлечено уроков учителя: 0")
+            return []
+
+        lessons = []
+        bad_markers = (
+            "не ответила вовремя",
+            "сейчас недоступна",
+            "нет локальной модели",
+            "ошибка",
+        )
+        try:
+            with open(lesson_path, "r", encoding="utf-8") as file_handle:
+                for line in file_handle:
+                    payload = line.strip()
+                    if not payload:
+                        continue
+                    try:
+                        row = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+
+                    instruction = str(row.get("instruction") or "").strip()
+                    answer = str(row.get("answer") or "").strip()
+                    if not instruction or not answer:
+                        continue
+                    lowered = answer.lower()
+                    if any(marker in lowered for marker in bad_markers):
+                        continue
+                    self._add_example(
+                        lessons,
+                        instruction,
+                        answer,
+                        weight=1.35,
+                        source="teacher_lessons",
+                    )
+        except OSError:
+            print("  Извлечено уроков учителя: 0")
+            return []
+
+        print(f"  Извлечено уроков учителя: {len(lessons)}")
+        return lessons
 
     def extract_logic_laws(self):
         rows = self._fetch_rows(
@@ -169,6 +218,7 @@ class DataPreparator:
         source_map.update(
             {
                 "dialogues": self.extract_dialogues(),
+                "teacher_lessons": self.extract_teacher_lessons(),
                 "logic_laws": self.extract_logic_laws(),
                 "knowledge_base": self.extract_knowledge_base(),
                 "knowledge_files": self.extract_from_files(),

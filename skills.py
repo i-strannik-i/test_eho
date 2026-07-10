@@ -14,7 +14,7 @@ import subprocess
 import time
 from datetime import datetime
 
-from project_paths import BUILD_RUN_LOG_FILE, GGUF_MODEL_PATH, KNOWLEDGE_INPUT_DIR, LOGS_DIR, LORA_OUTPUT_DIR, SKILL_LOG_FILE, TRAINING_DATA_FILE, TRAINING_RUN_LOG_FILE
+from project_paths import BUILD_RUN_LOG_FILE, DATABASE_FILE, GGUF_MODEL_PATH, KNOWLEDGE_INPUT_DIR, LOGS_DIR, LORA_OUTPUT_DIR, SKILL_LOG_FILE, TEACHER_DATA_FILE, TRAINING_DATA_FILE, TRAINING_RUN_LOG_FILE
 
 CONTROL_TEST_QUESTIONS = (
     "Что такое Эхо?",
@@ -63,6 +63,11 @@ class SkillManager:
             "учиться": (self.skill_training, "Запустить дообучение + автосборку", False),
             "собрать": (self.skill_build_gguf, "Собрать GGUF из весов", False),
         }
+
+    def _assistant_model_status(self):
+        if hasattr(self.assistant, "get_local_model_status"):
+            return self.assistant.get_local_model_status()
+        return "подключена" if getattr(self.assistant, "local_brain", None) else "не подключена"
 
     def _reset_session_logs(self):
         os.makedirs(LOGS_DIR, exist_ok=True)
@@ -327,7 +332,10 @@ class SkillManager:
             "Состояние:",
             f"  Режим: {self.assistant.cognitive_mode}",
             f"  Нейросеть: {'АКТИВНА' if self.assistant.embedding_model else 'ОТКЛЮЧЕНА'}",
-            f"  Локальная модель: {'ЗАГРУЖЕНА' if self.assistant.local_brain else 'НЕ ЗАГРУЖЕНА'}",
+            f"  Локальная модель: {self._assistant_model_status()}",
+            f"  База памяти: {DATABASE_FILE}",
+            f"  Уроки учителя: {getattr(self.assistant, 'count_teacher_lessons', lambda: 0)()}",
+            f"  Файл уроков: {TEACHER_DATA_FILE}",
         ]
         return "\n".join(lines)
     
@@ -357,6 +365,7 @@ class SkillManager:
         dataset_size = self._count_jsonl_rows(TRAINING_DATA_FILE)
         gguf_exists = os.path.exists(GGUF_MODEL_PATH)
         model_loaded = bool(getattr(self.assistant, "local_brain", None))
+        model_status = self._assistant_model_status()
 
         lines = [
             "Проверка текущего состояния обучения:",
@@ -364,6 +373,7 @@ class SkillManager:
             f"  Датасет: {TRAINING_DATA_FILE} ({dataset_size} примеров)" if dataset_size is not None else f"  Датасет: {TRAINING_DATA_FILE} (не найден)",
             f"  Последний checkpoint: {checkpoint_name}",
             f"  GGUF-модель: {'есть' if gguf_exists else 'ещё не собрана'}",
+            f"  Активная локальная модель: {model_status}",
             f"  Загружена в Эхо: {'да' if model_loaded else 'нет'}",
             "",
             "Как проверить результат:",
@@ -374,14 +384,15 @@ class SkillManager:
         else:
             lines.append("  Пока checkpoint ещё не создан, значит обучение слишком рано оценивать.")
 
-        if gguf_exists and model_loaded:
+        if model_loaded:
             lines.append("  Спросите прямо модель: /проверить что ты знаешь о ...")
             lines.append("  Пример: /проверить что такое Эхо?")
         elif gguf_exists:
             lines.append("  Сначала переключите собранную модель: /модель")
             lines.append("  Потом спросите: /проверить что такое Эхо?")
         else:
-            lines.append("  Для проверки ответов после обучения нужна сборка GGUF: /собрать")
+            lines.append("  Локальная модель пока не подключена. Попробуйте /restart.")
+            lines.append("  Для дообученной GGUF-версии сначала выполните /собрать.")
 
         lines.append("")
         lines.append("Что важно:")
@@ -496,6 +507,25 @@ class SkillManager:
     
     def skill_restart(self, args="", callback_dict=None):
         self.log("Перезагрузка модели...")
+        if hasattr(self.assistant, "reload_local_brain"):
+            success, status = self.assistant.reload_local_brain()
+            if success:
+                self.log(f"Модель активна: {status}")
+                self.log(f"  Потоков CPU: {self.assistant.cpu_threads}")
+                self.log(f"  Контекст: {self.assistant.n_ctx}")
+                return (
+                    f"Локальная модель перезапущена:\n"
+                    f"  {status}\n"
+                    f"  Потоков CPU: {self.assistant.cpu_threads}\n"
+                    f"  Контекстное окно: {self.assistant.n_ctx}"
+                )
+            self.log(f"Локальная модель недоступна: {status}")
+            if os.path.exists(GGUF_MODEL_PATH):
+                return (
+                    "Не удалось подключить локальную модель.\n"
+                    "Проверьте GGUF или доступность Ollama и повторите /restart."
+                )
+            return f"Модель не найдена: {GGUF_MODEL_PATH}\nСначала выполните /собрать"
         model_path = GGUF_MODEL_PATH
         if not os.path.exists(model_path):
             return f"Модель не найдена: {model_path}\nСначала выполните /собрать"
@@ -549,6 +579,19 @@ class SkillManager:
     
     def skill_switch_model(self, args="", callback_dict=None):
         self.log("Переключение модели...")
+        if hasattr(self.assistant, "reload_local_brain"):
+            preferred_backend = "gguf" if os.path.exists(GGUF_MODEL_PATH) else None
+            success, status = self.assistant.reload_local_brain(preferred_backend=preferred_backend)
+            if success:
+                if preferred_backend == "gguf":
+                    self.log("Модель переключена на дообученную!")
+                else:
+                    self.log(f"Активирована локальная модель: {status}")
+                return
+            self.log(f"Локальная модель недоступна: {status}")
+            if not os.path.exists(GGUF_MODEL_PATH):
+                self.log("Сначала запустите /собрать.")
+            return
         gguf_path = GGUF_MODEL_PATH
         if not os.path.exists(gguf_path):
             self.log(f"Модель не найдена: {gguf_path}")
@@ -712,14 +755,25 @@ class SkillManager:
         if not local_brain:
             if os.path.exists(GGUF_MODEL_PATH):
                 return None, "Собранная модель есть, но сейчас не загружена. Сначала выполните /модель, потом повторите проверку."
-            return None, "Сейчас загруженной локальной модели нет. Сначала завершите /собрать, затем выполните /модель."
+            return None, "Сейчас загруженной локальной модели нет. Выполните /restart или /модель."
 
         try:
             if hasattr(local_brain, "create_chat_completion"):
+                service_note = ""
+                backend = getattr(self.assistant, "active_model_backend", None)
+                model_name = getattr(self.assistant, "active_model_name", None)
+                if backend and model_name:
+                    service_note = f"\nСлужебный контекст: активная локальная модель = {backend}:{model_name}"
                 result = local_brain.create_chat_completion(
                     messages=[
-                        {"role": "system", "content": "Отвечай кратко и по-русски."},
-                        {"role": "user", "content": question},
+                        {
+                            "role": "system",
+                            "content": (
+                                "Отвечай кратко и по-русски. "
+                                "Если пользователь спрашивает о текущей модели, опирайся на служебный контекст."
+                            ),
+                        },
+                        {"role": "user", "content": f"{question}{service_note}"},
                     ],
                     temperature=0.2,
                     max_tokens=max_tokens,

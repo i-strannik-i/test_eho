@@ -1,12 +1,2 @@
-accelerate>=0.24.0
-datasets>=2.14.0
-llama-cpp-python>=0.2.90
-numpy>=1.26.0
-peft>=0.7.0
-protobuf>=3.20.0
-scipy>=1.11.0
-sentence-transformers>=2.7.0
-sentencepiece>=0.1.99
-torch>=2.0.0
-tqdm>=4.65.0
-transformers>=4.35.0
+# Runtime mode with Ollama does not require extra pip packages.
+# The app can start with the Python standard library only.
